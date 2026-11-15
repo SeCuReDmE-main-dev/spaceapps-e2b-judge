@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spaceapps-e2b-judge"
+version = "3.0.0"
+description = "Calibrated Multi-MicroVM Pre-Submission Judge & Eligibility Auditor for NASA Space Apps Challenge teams (powered by E2B Sandboxes & Gemini)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Jean-Sébastien Beaulieu" }
+]
+dependencies = [
+    "e2b>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+spaceapps-judge = "spaceapps_judge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+spaceapps_judge = ["rubric/*.md", "vm/*.py"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]

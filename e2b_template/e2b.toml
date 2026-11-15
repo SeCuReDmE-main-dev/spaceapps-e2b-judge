@@ -1,0 +1,6 @@
+# E2B Sandbox Template configuration for SpaceApps Judge v3.0
+# Build with: e2b template build --name spaceapps-judge-v3
+dockerfile = "e2b.Dockerfile"
+template_name = "spaceapps-judge-v3"
+memory_mb = 4096
+cpu_count = 2

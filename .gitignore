@@ -1,0 +1,19 @@
+# Secrets & environment
+.env
+.env.*
+!.env.example
+
+# Python bytecode & packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Generated judge run reports
+reports/
