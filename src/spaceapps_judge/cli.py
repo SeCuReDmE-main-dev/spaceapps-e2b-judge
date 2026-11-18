@@ -4,13 +4,17 @@ Architecture:
   - Wave 1 (1 isolated Probe MicroVM, zero LLM access):
       Runs deterministic eligibility & engineering probes (`G-01..G-09`, `E-01..E-08`),
       Playwright headless browser checks, clean-clone pytest/frontend build, and URL citation checks.
-  - Wave 2 (5 parallel isolated Judge MicroVMs):
-      Each generic institutional role judge runs in its own MicroVM with a prompt-enforced
-      350-word triage excerpt (for Local/Exec tiers), ranks a blind 10-project cohort
-      (`SYNTH_ARCH_01..09` + candidate), and produces a 5-part debrief.
+  - Wave 2 (N parallel isolated Judge MicroVMs, default 5):
+      Each judge (default: generic institutional roles; or any 1..10 judges from `judges.json`)
+      runs in its own MicroVM with a prompt-enforced 350-word triage excerpt (for Local/Exec tiers),
+      ranks a blind 10-project cohort (`SYNTH_ARCH_01..09` + candidate), and produces a 5-part debrief.
   - Wave 3 (Deterministic Anti-Hallucination Verifier & Report Generator):
       Validates every verbatim quote against the submission corpus and Wave 1 evidence ledger,
       computes Kendall tau concordance on the 9 synthetic calibration archetypes, and writes `JUDGEMENT_REPORT.md`.
+
+Any hackathon: `hackathon_settings.json` (gates, K criteria, awards), `hackathon_rules.md` (judging guide),
+`challenge_brief.md` and `judges.json` are auto-detected in the submission folder (or passed by flag).
+Without them, the NASA Space Apps 2026 v3.0 defaults apply unchanged.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -29,15 +34,94 @@ from pathlib import Path
 from e2b import Sandbox
 
 from spaceapps_judge.envkeys import load_keys
+from spaceapps_judge.vm.hackathon_config import (
+    CHALLENGE_FILENAME,
+    DEFAULT_JUDGE_ORDER,
+    DEFAULT_JUDGES,
+    JUDGES_FILENAME,
+    RULES_FILENAME,
+    SETTINGS_FILENAME,
+    criterion_names,
+    default_settings,
+    load_judges_file,
+    load_settings_file,
+    max_total,
+)
 
 PKG_DIR = Path(__file__).resolve().parent
-JUDGE_ORDER = [
-    "J1_local_ux_ai_reviewer",
-    "J2_local_geomatics_data_reviewer",
-    "J3_global_planetary_cartography_sme",
-    "J4_global_geodesy_ivv_sme",
-    "J5_exec_mission_directorate_reviewer",
-]
+JUDGE_ORDER = list(DEFAULT_JUDGE_ORDER)
+DEFAULT_JUDGING_GUIDE = PKG_DIR / "rubric" / "judging_guide_2026.md"
+DEFAULT_CHALLENGE_BRIEF = PKG_DIR / "rubric" / "challenge_martian_map_2026.md"
+
+
+def _pick(explicit: Path | None, sub_dir: Path, filename: str, flag: str) -> tuple[Path | None, str]:
+    """Explicit flag > auto-detected file in the submission folder > None (packaged default)."""
+    if explicit is not None:
+        p = explicit.resolve()
+        if not p.is_file():
+            raise SystemExit(f"{flag} file not found: {p}")
+        return p, f"{flag} ({p.name})"
+    auto = sub_dir / filename
+    if auto.is_file():
+        return auto, f"auto-detected {filename} in submission folder"
+    return None, "default (NASA Space Apps 2026)"
+
+
+def resolve_run_config(
+    sub_dir: Path,
+    hackathon_settings: Path | None = None,
+    judging_guide: Path | None = None,
+    challenge_rubric: Path | None = None,
+    judges_config: Path | None = None,
+) -> dict:
+    """Resolve and validate every hackathon/judge input before any VM is created (fail fast on bad JSON)."""
+    settings_path, settings_src = _pick(hackathon_settings, sub_dir, SETTINGS_FILENAME, "--hackathon-settings")
+    guide_path, guide_src = _pick(judging_guide, sub_dir, RULES_FILENAME, "--judging-guide")
+    challenge_path, challenge_src = _pick(challenge_rubric, sub_dir, CHALLENGE_FILENAME, "--challenge-rubric")
+    judges_path, judges_src = _pick(judges_config, sub_dir, JUDGES_FILENAME, "--judges-config")
+    try:
+        settings = load_settings_file(settings_path) if settings_path else default_settings()
+        judges = (
+            load_judges_file(judges_path, settings["hackathon_name"]) if judges_path else dict(DEFAULT_JUDGES)
+        )
+    except ValueError as e:
+        raise SystemExit(f"Invalid hackathon configuration: {e}") from None
+    return {
+        "settings_path": settings_path,
+        "judges_path": judges_path,
+        "guide_path": guide_path or DEFAULT_JUDGING_GUIDE,
+        "challenge_path": challenge_path or DEFAULT_CHALLENGE_BRIEF,
+        "settings": settings,
+        "judges": judges,
+        "judge_order": list(judges),
+        "sources": {
+            "hackathon_settings": settings_src,
+            "judging_guide": guide_src,
+            "challenge_brief": challenge_src,
+            "judges": judges_src,
+        },
+    }
+
+
+def build_bundle(cfg: dict, sub_dir: Path) -> dict[str, Path]:
+    """Remote VM path -> local file. Explicit config files override same-named files from the submission folder."""
+    bundle: dict[str, Path] = {
+        "/judge/rubric/judging_guide_2026.md": cfg["guide_path"],
+        "/judge/rubric/challenge_martian_map_2026.md": cfg["challenge_path"],
+        "/judge/vm/probes.py": PKG_DIR / "vm" / "probes.py",
+        "/judge/vm/calibration_cohort.py": PKG_DIR / "vm" / "calibration_cohort.py",
+        "/judge/vm/hackathon_config.py": PKG_DIR / "vm" / "hackathon_config.py",
+        "/judge/vm/panel.py": PKG_DIR / "vm" / "panel.py",
+        "/judge/vm/report.py": PKG_DIR / "vm" / "report.py",
+    }
+    for p in sub_dir.iterdir():
+        if p.is_file():
+            bundle[f"/judge/input/{p.name}"] = p
+    if cfg["settings_path"] is not None:
+        bundle[f"/judge/input/{SETTINGS_FILENAME}"] = cfg["settings_path"]
+    if cfg["judges_path"] is not None:
+        bundle[f"/judge/input/{JUDGES_FILENAME}"] = cfg["judges_path"]
+    return bundle
 
 
 def sha256_file(p: Path) -> str:
@@ -98,12 +182,18 @@ def create_sandbox(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="spaceapps-judge",
-        description="Run SpaceApps E2B Judge v3.0 (Calibrated 10-Project Cohort & 5 Isolated Judge MicroVMs).",
+        description=(
+            "Run SpaceApps E2B Judge v3.0 (Calibrated 10-Project Cohort & N Isolated Judge MicroVMs; "
+            "NASA Space Apps defaults or any hackathon via hackathon_settings.json + judges.json)."
+        ),
     )
     ap.add_argument(
         "submission_dir",
         type=Path,
-        help="Folder containing submission.json, submission_text.md, and optional demo file.",
+        help=(
+            "Folder containing submission.json, submission_text.md, optional demo file, and optional "
+            "hackathon_settings.json / hackathon_rules.md / challenge_brief.md / judges.json (auto-detected)."
+        ),
     )
     ap.add_argument("--model", default="gemini-3.8-flash", help="Default Gemini model ID.")
     ap.add_argument("--fallback", default="gemini-3.5-flash", help="Fallback Gemini model ID.")
@@ -116,8 +206,38 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--challenge-rubric",
         type=Path,
-        default=PKG_DIR / "rubric" / "challenge_martian_map_2026.md",
-        help="Path to the challenge brief markdown file (defaults to Martian Map 2026 brief).",
+        default=None,
+        help=(
+            "Challenge brief markdown (default: <submission_dir>/challenge_brief.md if present, "
+            "else the packaged Martian Map 2026 brief)."
+        ),
+    )
+    ap.add_argument(
+        "--judging-guide",
+        type=Path,
+        default=None,
+        help=(
+            "Hackathon rules / judging guide markdown (default: <submission_dir>/hackathon_rules.md if present, "
+            "else the packaged NASA Space Apps 2026 judging guide)."
+        ),
+    )
+    ap.add_argument(
+        "--hackathon-settings",
+        type=Path,
+        default=None,
+        help=(
+            "hackathon_settings.json: gates, K criteria and awards (default: <submission_dir>/hackathon_settings.json "
+            "if present, else NASA Space Apps 2026 defaults). See templates/hackathon_settings_template.json."
+        ),
+    )
+    ap.add_argument(
+        "--judges-config",
+        type=Path,
+        default=None,
+        help=(
+            "judges.json with 1..10 judge personas (default: <submission_dir>/judges.json if present, "
+            "else the 5 NASA v3.0 role personas). See templates/judge_panel_template.json."
+        ),
     )
     ap.add_argument(
         "--out",
@@ -140,9 +260,15 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"submission.json not found in {sub_dir}")
     sub = json.loads(sub_json.read_text(encoding="utf-8"))
 
-    challenge_path = a.challenge_rubric.resolve()
-    if not challenge_path.is_file():
-        raise SystemExit(f"Challenge rubric file not found: {challenge_path}")
+    cfg = resolve_run_config(
+        sub_dir,
+        hackathon_settings=a.hackathon_settings,
+        judging_guide=a.judging_guide,
+        challenge_rubric=a.challenge_rubric,
+        judges_config=a.judges_config,
+    )
+    judge_order: list[str] = cfg["judge_order"]
+    settings = cfg["settings"]
 
     keys = load_keys("E2B_API_KEY", "GEMINI_API_KEY", env_file=a.env_file)
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -158,17 +284,7 @@ def main(argv: list[str] | None = None) -> int:
             log.write(s)
             log.flush()
 
-    bundle: dict[str, Path] = {
-        "/judge/rubric/judging_guide_2026.md": PKG_DIR / "rubric" / "judging_guide_2026.md",
-        "/judge/rubric/challenge_martian_map_2026.md": challenge_path,
-        "/judge/vm/probes.py": PKG_DIR / "vm" / "probes.py",
-        "/judge/vm/calibration_cohort.py": PKG_DIR / "vm" / "calibration_cohort.py",
-        "/judge/vm/panel.py": PKG_DIR / "vm" / "panel.py",
-        "/judge/vm/report.py": PKG_DIR / "vm" / "report.py",
-    }
-    for p in sub_dir.iterdir():
-        if p.is_file():
-            bundle[f"/judge/input/{p.name}"] = p
+    bundle = build_bundle(cfg, sub_dir)
 
     manifest = {
         "project_title": sub.get("project_title"),
@@ -177,13 +293,24 @@ def main(argv: list[str] | None = None) -> int:
         "gemini_cli_version": a.gemini_cli,
         "e2b_template": a.template or "base",
         "parallel_vms": True,
-        "judges": JUDGE_ORDER,
+        "judges": judge_order,
+        "judge_tiers": {jid: cfg["judges"][jid]["tier"] for jid in judge_order},
+        "hackathon_name": settings["hackathon_name"],
+        "criteria": criterion_names(settings),
+        "max_total": max_total(settings),
+        "hackathon_settings": {k: v for k, v in settings.items() if k != "is_default"},
+        "config_sources": cfg["sources"],
         "host_started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "sha256": {remote: sha256_file(local) for remote, local in sorted(bundle.items())},
     }
     (dest / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
 
-    echo(f"=== SPACEAPPS E2B JUDGE v3.0 START (5 Parallel VMs) -> {dest} ===\n")
+    echo(
+        f"=== SPACEAPPS E2B JUDGE v3.0 START ({len(judge_order)} Parallel VMs · {settings['hackathon_name']} · "
+        f"{len(manifest['criteria'])} criteria /{manifest['max_total']}) -> {dest} ===\n"
+    )
+    for label, src in cfg["sources"].items():
+        echo(f"[Config] {label}: {src}\n")
 
     # --------------------------------------------------------- WAVE 1: PROBE VM
     if a.reuse_wave1 and (a.reuse_wave1.resolve() / "evidence.json").exists():
@@ -249,7 +376,7 @@ def main(argv: list[str] | None = None) -> int:
         log.close()
         return 1
 
-    # --------------------------------------------------------- WAVE 2: 5 PARALLEL JUDGE VMs
+    # --------------------------------------------------------- WAVE 2: N PARALLEL JUDGE VMs
     api_gate = threading.Semaphore(2)
     api_last_call = [0.0]
     api_lock = threading.Lock()
@@ -302,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 run_cmd(
                     sb_j,
-                    f"cd /judge && python3 vm/panel.py {a.model}{fb_arg} --judge {jid}",
+                    f"cd /judge && python3 vm/panel.py {a.model}{fb_arg} --judge {shlex.quote(jid)}",
                     1200,
                     j_echo,
                     envs={"GEMINI_API_KEY": keys["GEMINI_API_KEY"]},
@@ -350,13 +477,14 @@ def main(argv: list[str] | None = None) -> int:
                     pass
 
     panel_map: dict[str, dict] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-        futs = [pool.submit(run_single_judge_vm, jid) for jid in JUDGE_ORDER]
+    echo(f"\n[Wave 2] Launching {len(judge_order)} judge VMs ({len(judge_order)} Parallel VMs): {judge_order}\n")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(judge_order), 8))) as pool:
+        futs = [pool.submit(run_single_judge_vm, jid) for jid in judge_order]
         for fut in concurrent.futures.as_completed(futs):
             jid, data = fut.result()
             panel_map[jid] = data
 
-    ordered_panel = [panel_map[jid] for jid in JUDGE_ORDER if jid in panel_map]
+    ordered_panel = [panel_map[jid] for jid in judge_order if jid in panel_map]
     (dest / "panel_raw.json").write_text(
         json.dumps(ordered_panel, indent=1, ensure_ascii=False), encoding="utf-8"
     )

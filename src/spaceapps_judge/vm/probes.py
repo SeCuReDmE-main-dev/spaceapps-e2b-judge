@@ -2,6 +2,9 @@
 
 Produces /judge/out/evidence.json : the only facts the judges may rely on.
 Every fact gets a stable id (G-xx for eligibility gate, E-xx for evidence) and a tier ("ALL" or "SME").
+
+Gates G-04..G-08 are driven by /judge/input/hackathon_settings.json when present
+(NASA Space Apps 2026 v3.0 defaults otherwise).
 """
 
 from __future__ import annotations
@@ -9,22 +12,48 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hackathon_config import (  # noqa: E402
+    DEFAULT_REQUIRED_KEYWORDS as SETTINGS_DEFAULT_KEYWORDS,
+    NASA_MIN_KEYWORD_HITS,
+    NASA_STRONG_KEYWORDS,
+    default_settings,
+    resolve_settings,
+    uses_default_keywords,
+)
 
 ROOT = Path("/judge")
 INP = ROOT / "input"
 OUT = ROOT / "out"
 WORK = ROOT / "work"
-OUT.mkdir(parents=True, exist_ok=True)
-WORK.mkdir(parents=True, exist_ok=True)
 
-SUB = json.loads((INP / "submission.json").read_text(encoding="utf-8"))
+SUB: dict = {}
 SUB_TEXT = ""
-if SUB.get("submission_text_file") and (INP / SUB["submission_text_file"]).exists():
-    SUB_TEXT = (INP / SUB["submission_text_file"]).read_text(encoding="utf-8", errors="replace")
+SETTINGS: dict = default_settings()
 
 evidence: list[dict] = []
+
+
+def bootstrap() -> None:
+    """Load the submission and hackathon settings (called from __main__ only, so the module stays importable)."""
+    global SUB, SUB_TEXT, SETTINGS
+    OUT.mkdir(parents=True, exist_ok=True)
+    WORK.mkdir(parents=True, exist_ok=True)
+    SUB = json.loads((INP / "submission.json").read_text(encoding="utf-8"))
+    SUB_TEXT = ""
+    if SUB.get("submission_text_file") and (INP / SUB["submission_text_file"]).exists():
+        SUB_TEXT = (INP / SUB["submission_text_file"]).read_text(encoding="utf-8", errors="replace")
+    SETTINGS = resolve_settings(INP)
+    print(
+        f"[settings] {SETTINGS['hackathon_name']} "
+        f"({'NASA Space Apps defaults' if SETTINGS['is_default'] else 'hackathon_settings.json'}): "
+        f"{json.dumps(SETTINGS['gates'])[:600]}",
+        flush=True,
+    )
 
 
 def add(kind: str, probe: str, status: str, fact: str, excerpt: str = "", tier: str = "ALL") -> str:
@@ -109,136 +138,159 @@ def gate() -> None:
             "No repository URL provided (not strictly required if the public URL works).",
         )
 
-    demo = SUB.get("demo_file")
-    p = INP / demo if demo else None
-    if not p or not p.exists():
-        add(
-            "G",
-            "demo_limits",
-            "FAIL",
-            "No demo file provided (7-slide deck or <=30 s video is mandatory).",
-        )
-    else:
-        ext = p.suffix.lower()
-        if ext == ".pdf":
-            from pypdf import PdfReader
-
-            n = len(PdfReader(str(p)).pages)
-            add(
-                "G",
-                "demo_limits",
-                "PASS" if n <= 7 else "FAIL",
-                f"Demo PDF has {n} slides/pages (limit 7).",
-            )
-        elif ext == ".pptx":
-            from pptx import Presentation
-
-            n = len(Presentation(str(p)).slides)
-            add(
-                "G",
-                "demo_limits",
-                "PASS" if n <= 7 else "FAIL",
-                f"Demo PPTX has {n} slides (limit 7).",
-            )
-        elif ext in (".mp4", ".mov", ".webm", ".mkv"):
-            import imageio_ffmpeg
-
-            ff = imageio_ffmpeg.get_ffmpeg_exe()
-            _, info = sh(f"'{ff}' -i '{p}' 2>&1", 60)
-            m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", info)
-            secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else -1
-            add(
-                "G",
-                "demo_limits",
-                "PASS" if 0 < secs <= 30.0 else "FAIL",
-                f"Demo video duration {secs:.2f} s (limit 30 s).",
-            )
-        else:
-            add("G", "demo_limits", "FAIL", f"Unsupported demo format {ext}; cannot verify limits.")
+    gates = SETTINGS["gates"]
+    add("G", "demo_limits", *check_demo_limits(INP, SUB.get("demo_file"), gates))
 
     if SUB_TEXT.strip():
-        from langdetect import DetectorFactory, detect_langs
-
-        DetectorFactory.seed = 0
-        langs = detect_langs(SUB_TEXT[:20000])
-        top = langs[0]
+        lang_code = gates.get("required_language")
         add(
             "G",
-            "english_language",
-            "PASS" if top.lang == "en" and top.prob > 0.9 else "FAIL",
-            f"Submission text language detection: {[(ln.lang, round(ln.prob, 3)) for ln in langs]}",
+            "english_language" if lang_code == "en" else "submission_language",
+            *check_language(SUB_TEXT, lang_code),
         )
 
-    nasa_terms = [
-        "nasa",
-        "jpl",
-        "hirise",
-        "mola",
-        "ctx",
-        "crism",
-        "themis",
-        "mars trek",
-        "pds",
-        "usgs",
-        "mars reconnaissance orbiter",
-        "mro",
-        "mars global surveyor",
-        "perseverance",
-        "curiosity",
-        "msl",
-        "mars 2020",
-        "rad ",
-        "meda",
-        "maven",
-        "odyssey",
-        "insight",
-    ]
-    low = SUB_TEXT.lower()
-    hits = sorted({t.strip() for t in nasa_terms if t in low})
     add(
         "G",
-        "nasa_data_cited",
-        "PASS" if any(h in hits for h in ("nasa", "jpl", "pds")) or len(hits) >= 2 else "FAIL",
-        f"NASA data/mission terms found in submission text: {hits}",
+        "nasa_data_cited" if uses_default_keywords(gates) else "required_keywords_cited",
+        *check_required_keywords(SUB_TEXT, gates.get("required_keywords") or []),
     )
+    add("G", "references_listed", *check_references(SUB_TEXT, bool(gates.get("require_references", True))))
+    add("G", "ai_disclosure", *check_ai_disclosure(SUB_TEXT, bool(gates.get("require_ai_disclosure", True))))
 
-    refs = bool(
-        re.search(
-            r"^\s*#*\s*(?:\d+[\.\)]\s*)?(references|sources|data sources|resources used)\b",
-            SUB_TEXT,
-            re.I | re.M,
-        )
+    deadline = (
+        "deadline Sunday Nov 15 2026 23:59 local time (Montreal, UTC-5)."
+        if SETTINGS.get("is_default", True)
+        else f"deadline {SUB.get('deadline_local_iso') or 'not specified in submission.json'} "
+        f"({SETTINGS['hackathon_name']})."
     )
-    add(
-        "G",
-        "references_listed",
-        "PASS" if refs else "FAIL",
-        "A References/Sources section is present."
-        if refs
-        else "No References/Sources section found in submission text.",
-    )
-    ai = re.search(
-        r"(use of (ai|artificial intelligence)|ai (tools|disclosure|usage|assistance)|generative ai|"
-        r"\bllm\b|chatgpt|claude|gemini|copilot)",
-        SUB_TEXT,
-        re.I,
-    )
-    add(
-        "G",
-        "ai_disclosure",
-        "PASS" if ai else "FAIL",
-        f"AI usage disclosure found (matched '{ai.group(0)}')."
-        if ai
-        else "No AI usage disclosure found.",
-    )
-
     add(
         "G",
         "deadline_context",
         "INFO",
-        f"Judge run at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}; "
-        "deadline Sunday Nov 15 2026 23:59 local time (Montreal, UTC-5).",
+        f"Judge run at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}; " + deadline,
     )
+
+
+# ------------------------------------------------- SETTINGS-DRIVEN GATE CHECKS
+def _video_duration_sec(p: Path) -> float:
+    import imageio_ffmpeg
+
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    _, info = sh(f"'{ff}' -i '{p}' 2>&1", 60)
+    m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", info)
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else -1
+
+
+def _detect_langs(text: str) -> list[tuple[str, float]]:
+    from langdetect import DetectorFactory, detect_langs
+
+    DetectorFactory.seed = 0
+    return [(ln.lang, ln.prob) for ln in detect_langs(text[:20000])]
+
+
+def _limit_txt(max_slides: int | None, max_video_sec: float | None) -> str:
+    if max_slides is not None and max_video_sec is not None:
+        return f"{max_slides}-slide deck or <={max_video_sec:g} s video"
+    if max_slides is not None:
+        return f"<= {max_slides}-slide deck or video of any length"
+    if max_video_sec is not None:
+        return f"slide deck of any length or <={max_video_sec:g} s video"
+    return "slide deck or video, no length limit"
+
+
+def check_demo_limits(inp: Path, demo: str | None, gates: dict) -> tuple[str, str]:
+    """G-04: demo deliverable vs. hackathon `max_slides` / `max_video_sec` / `require_demo_file`."""
+    max_slides = gates.get("max_slides")
+    max_video = gates.get("max_video_sec")
+    required = bool(gates.get("require_demo_file", True))
+    p = inp / demo if demo else None
+    if not p or not p.exists():
+        if required:
+            return "FAIL", f"No demo file provided ({_limit_txt(max_slides, max_video)} is mandatory)."
+        return "INFO", "No demo file provided (not required by hackathon settings)."
+    slide_lim = f"limit {max_slides}" if max_slides is not None else "no slide limit set by hackathon settings"
+    ext = p.suffix.lower()
+    if ext == ".pdf":
+        from pypdf import PdfReader
+
+        n = len(PdfReader(str(p)).pages)
+        return ("PASS" if max_slides is None or n <= max_slides else "FAIL"), (
+            f"Demo PDF has {n} slides/pages ({slide_lim})."
+        )
+    if ext == ".pptx":
+        from pptx import Presentation
+
+        n = len(Presentation(str(p)).slides)
+        return ("PASS" if max_slides is None or n <= max_slides else "FAIL"), (
+            f"Demo PPTX has {n} slides ({slide_lim})."
+        )
+    if ext in (".mp4", ".mov", ".webm", ".mkv"):
+        secs = _video_duration_sec(p)
+        ok = 0 < secs and (max_video is None or secs <= max_video)
+        vid_lim = f"limit {max_video:g} s" if max_video is not None else "no duration limit set by hackathon settings"
+        return ("PASS" if ok else "FAIL"), f"Demo video duration {secs:.2f} s ({vid_lim})."
+    if not required:
+        return "INFO", f"Unsupported demo format {ext}; cannot verify limits (demo not required by hackathon settings)."
+    return "FAIL", f"Unsupported demo format {ext}; cannot verify limits."
+
+
+def check_language(text: str, lang_code: str | None) -> tuple[str, str]:
+    """G-05: submission language vs. hackathon `required_language` (null = any language accepted)."""
+    if not lang_code:
+        return "PASS", "Any submission language accepted (required_language is null in hackathon settings)."
+    langs = _detect_langs(text)
+    top_lang, top_prob = langs[0]
+    ok = top_lang.split("-")[0] == lang_code.split("-")[0] and top_prob > 0.9
+    return ("PASS" if ok else "FAIL"), (
+        f"Submission text language detection: {[(lang, round(prob, 3)) for lang, prob in langs]}"
+        + ("" if lang_code == "en" else f" (required: {lang_code})")
+    )
+
+
+def check_required_keywords(text: str, keywords: list[str]) -> tuple[str, str]:
+    """G-06: sponsor/dataset keywords. Empty list = no mandatory keywords (PASS, never blocks eligibility)."""
+    if not keywords:
+        return "PASS", "No mandatory sponsor/dataset keywords required by hackathon settings."
+    low = text.lower()
+    hits = sorted({t.strip() for t in keywords if t in low})
+    if keywords == list(SETTINGS_DEFAULT_KEYWORDS):
+        ok = any(h in hits for h in NASA_STRONG_KEYWORDS) or len(hits) >= NASA_MIN_KEYWORD_HITS
+        return ("PASS" if ok else "FAIL"), f"NASA data/mission terms found in submission text: {hits}"
+    return ("PASS" if hits else "FAIL"), (
+        f"Required sponsor/dataset keywords found in submission text: {hits} "
+        f"(at least 1 of {[k.strip() for k in keywords][:30]} required)"
+    )
+
+
+def check_references(text: str, required: bool) -> tuple[str, str]:
+    """G-07: References/Sources section (`require_references`)."""
+    refs = bool(
+        re.search(
+            r"^\s*#*\s*(?:\d+[\.\)]\s*)?(references|sources|data sources|resources used)\b",
+            text,
+            re.I | re.M,
+        )
+    )
+    if refs:
+        return "PASS", "A References/Sources section is present."
+    if not required:
+        return "INFO", "No References/Sources section found (not required by hackathon settings)."
+    return "FAIL", "No References/Sources section found in submission text."
+
+
+def check_ai_disclosure(text: str, required: bool) -> tuple[str, str]:
+    """G-08: AI usage disclosure (`require_ai_disclosure`)."""
+    ai = re.search(
+        r"(use of (ai|artificial intelligence)|ai (tools|disclosure|usage|assistance)|generative ai|"
+        r"\bllm\b|chatgpt|claude|gemini|copilot)",
+        text,
+        re.I,
+    )
+    if ai:
+        return "PASS", f"AI usage disclosure found (matched '{ai.group(0)}')."
+    if not required:
+        return "INFO", "No AI usage disclosure found (not required by hackathon settings)."
+    return "FAIL", "No AI usage disclosure found."
 
 
 # ------------------------------------------------------------- EVIDENCE (E-xx)
@@ -564,6 +616,7 @@ def citations() -> None:
 
 
 if __name__ == "__main__":
+    bootstrap()
     gate()
     for fn in (site, repo, citations):
         try:

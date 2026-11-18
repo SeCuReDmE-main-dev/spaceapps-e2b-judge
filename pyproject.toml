@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spaceapps-e2b-judge"
 version = "3.0.0"
-description = "Calibrated Multi-MicroVM Pre-Submission Judge & Eligibility Auditor for NASA Space Apps Challenge teams (powered by E2B Sandboxes & Gemini)"
+description = "JuryBox (formerly SpaceApps E2B Judge v3.0): Calibrated Multi-MicroVM Pre-Submission Jury & Eligibility Auditor for NASA Space Apps or any hackathon, with 1..10 AI-configurable judges (powered by E2B Sandboxes & Gemini)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 spaceapps-judge = "spaceapps_judge.cli:main"
+jurybox = "spaceapps_judge.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

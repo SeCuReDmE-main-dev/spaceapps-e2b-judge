@@ -1,0 +1,90 @@
+{
+  "_AI_AGENT_INSTRUCTIONS": [
+    "<!-- AI AGENT INSTRUCTIONS -->",
+    "1. Read the OFFICIAL rules, submission requirements, judging criteria and prize pages of the user's hackathon (URLs or pasted text supplied by the user). Never invent a rule: if a value is not stated, keep the default below and say so to the user.",
+    "2. Copy this file to <submission_folder>/hackathon_settings.json and replace the values. Keys that start with '_' are documentation and are ignored by the tool; you may delete them.",
+    "3. Any key you OMIT falls back to the NASA Space Apps 2026 default shown here. For a non-NASA hackathon, set every field explicitly (use null or [] to disable a gate).",
+    "4. gates.max_slides: integer slide limit for a PDF/PPTX demo, or null for no limit (NASA = 7, many Devpost hackathons = 15 or null).",
+    "5. gates.max_video_sec: maximum demo video length in seconds, or null for no limit (NASA = 30.0, Devpost often = 180.0, ETHGlobal often = 240.0).",
+    "6. gates.require_demo_file: true if a slide deck or video demo is mandatory for eligibility, false otherwise.",
+    "7. gates.required_language: ISO 639-1 code the submission text must be written in (e.g. 'en', 'fr'), or null to accept any language.",
+    "8. gates.required_keywords: lowercase sponsor / dataset / technology keywords the submission text MUST mention (case-insensitive substring match, at least 1 hit required). Use [] when the hackathon has no mandatory sponsor or dataset: gate G-06 then PASSES automatically and never blocks eligibility. The 22-term NASA list below is only correct for NASA Space Apps.",
+    "9. gates.require_references / gates.require_ai_disclosure: true only if the rules make a References section or an AI-usage disclosure mandatory.",
+    "10. criteria: the K official judging criteria in the hackathon's own words (1 to 10 items). Each is scored 1-5, so the total is /5K (5 criteria = /25, 4 criteria = /20). Put the official 'what a top score looks like' wording in description.",
+    "11. awards: exact names of the official prizes / tracks (judges must pick from this list), or [] when there is no official list (judges may then propose any category).",
+    "12. Validate the result is strict JSON (double quotes, no trailing commas, no comments) before saving."
+  ],
+  "_FIELD_GUIDE": {
+    "hackathon_name": "Display name used in prompts and in the report title, e.g. 'ETHGlobal Online 2026', 'Devpost Gen AI Hackathon', 'My Custom Hackathon'.",
+    "gates": "Eligibility gates G-04..G-08 checked deterministically (no LLM) inside the Wave 1 probe VM.",
+    "criteria": "List of {name, description}. Names are copied verbatim into the judge JSON schema and the report.",
+    "awards": "List of strings. Empty list = free-form award fit, nothing is rejected for its award name."
+  },
+  "hackathon_name": "NASA Space Apps Challenge 2026",
+  "gates": {
+    "max_slides": 7,
+    "max_video_sec": 30.0,
+    "require_demo_file": true,
+    "required_language": "en",
+    "required_keywords": [
+      "nasa",
+      "jpl",
+      "hirise",
+      "mola",
+      "ctx",
+      "crism",
+      "themis",
+      "mars trek",
+      "pds",
+      "usgs",
+      "mars reconnaissance orbiter",
+      "mro",
+      "mars global surveyor",
+      "perseverance",
+      "curiosity",
+      "msl",
+      "mars 2020",
+      "rad ",
+      "meda",
+      "maven",
+      "odyssey",
+      "insight"
+    ],
+    "require_references": true,
+    "require_ai_disclosure": true
+  },
+  "criteria": [
+    {
+      "name": "Impact",
+      "description": "Addresses a minor or major problem; reach, inspiration and effectiveness of the proposed solution."
+    },
+    {
+      "name": "Creativity",
+      "description": "Originality and innovation: a novel concept or a meaningful improvement upon existing ideas."
+    },
+    {
+      "name": "Validity",
+      "description": "Grounded in scientific principles; technically, functionally and logically feasible; usable."
+    },
+    {
+      "name": "Relevance",
+      "description": "Fully addresses the challenge and integrates NASA data as a core component, not a superficial add-on."
+    },
+    {
+      "name": "Presentation",
+      "description": "Clear, engaging, well-structured communication of the challenge, solution and significance (demo + project)."
+    }
+  ],
+  "awards": [
+    "Best Use of Science",
+    "Best Use of Data",
+    "Best Use of Technology",
+    "Galactic Impact",
+    "Best Mission Concept",
+    "Most Inspirational",
+    "Best Storytelling Award",
+    "Global Connection Award",
+    "Art & Technology Award",
+    "Local Impact Award"
+  ]
+}

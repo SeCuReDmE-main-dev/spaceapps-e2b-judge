@@ -1,13 +1,16 @@
-"""Panel of 5 independent Gemini judges with generic institutional role personas, run INSIDE isolated E2B VMs.
+"""Panel of N independent Gemini judges (default: 5 generic institutional role personas), run INSIDE isolated E2B VMs.
 
 Each judge runs in its own isolated MicroVM (via --judge <jid>) with a fresh HOME, tools disabled,
 and tier-filtered evidence (TIER_1_LOCAL sees only tier=='ALL'; TIER_2_SME and TIER_3_EXEC see all).
+Judges come from /judge/input/judges.json and criteria/awards from /judge/input/hackathon_settings.json
+when present (NASA Space Apps 2026 v3.0 defaults otherwise).
 Output = strict JSON, validated by vm/report.py.
 """
 
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -22,9 +25,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from calibration_cohort import CALIBRATION_COHORT  # noqa: E402
+from hackathon_config import (  # noqa: E402
+    DEFAULT_AWARDS,
+    DEFAULT_JUDGES,
+    criterion_names,
+    default_settings,
+    max_total,
+    normalize_tier,
+    resolve_judges,
+    resolve_settings,
+)
 
 ROOT = Path("/judge")
 OUT = ROOT / "out"
+INP = ROOT / "input"
 MODEL = (
     sys.argv[1]
     if len(sys.argv) > 1 and not sys.argv[1].startswith("--")
@@ -41,142 +55,30 @@ for idx, arg in enumerate(sys.argv):
     if arg == "--judge" and idx + 1 < len(sys.argv):
         SINGLE_JUDGE = sys.argv[idx + 1]
 
-RUBRIC = (ROOT / "rubric" / "judging_guide_2026.md").read_text(encoding="utf-8")
-CHALLENGE = (ROOT / "rubric" / "challenge_martian_map_2026.md").read_text(encoding="utf-8")
-SUB = json.loads((ROOT / "input" / "submission.json").read_text(encoding="utf-8"))
-SUB_TEXT = (
-    (ROOT / "input" / SUB["submission_text_file"]).read_text(encoding="utf-8", errors="replace")
-    if SUB.get("submission_text_file") and (ROOT / "input" / SUB["submission_text_file"]).exists()
-    else ""
-)
-EVIDENCE = json.loads((OUT / "evidence.json").read_text(encoding="utf-8"))
+# Runtime inputs are loaded by load_runtime() (called from main) so the module stays importable for tests.
+RUBRIC = ""
+CHALLENGE = ""
+SUB: dict = {}
+SUB_TEXT = ""
+EVIDENCE: list[dict] = []
+SETTINGS: dict = default_settings()
 
 # ---------------------------------------------------------------------------
-# 5 Generic Role-Based Judge Personas (Zero Real Individual Names)
+# Judges (default: 5 generic role-based personas, zero real individual names) & official awards
 # ---------------------------------------------------------------------------
-JUDGES: dict[str, dict[str, str]] = {
-    "J1_local_ux_ai_reviewer": {
-        "tier": "TIER_1_LOCAL",
-        "preferred_model": "gemini-3.8-flash",
-        "temperature": "0.65",
-        "time_limit_sec": "180",
-        "queue_pressure": (
-            "Project 34 of 42 in the Local Hackathon Triage Queue (simulated 180-second / 3-minute "
-            "review budget before locking in your ballot)"
-        ),
-        "role": (
-            "You are a Local Hackathon Judge specializing in Cartographic UX, Graph Algorithms, and "
-            "Responsible AI Engineering. You are evaluating ~40 projects in a tight review session with "
-            "a 3-minute (180-second) triage budget per project. You care deeply about: (1) immediate visual "
-            "and cartographic clarity of the GO / CAUTION / NO_GO survival map for a non-specialist; "
-            "(2) genuine algorithmic rigor (real graph/pathfinding math vs. superficial wrappers); "
-            "(3) 'Thoughtful use of AI' — transparent human-directed engineering where every decision is "
-            "verified by deterministic tests; and (4) presentation completeness (7-slide deck or <=30s video "
-            "and live interactive URL)."
-        ),
-    },
-    "J2_local_geomatics_data_reviewer": {
-        "tier": "TIER_1_LOCAL",
-        "preferred_model": "gemini-3.8-flash",
-        "temperature": "0.55",
-        "time_limit_sec": "300",
-        "queue_pressure": (
-            "Project 37 of 40 in the Local Applied Geomatics & Open Data Queue (simulated 300-second / "
-            "5-minute total review budget)"
-        ),
-        "role": (
-            "You are a Local Hackathon Judge specializing in Applied Geomatics, Remote Sensing, and "
-            "Open-Science Data Provenance. You have a 5-minute (300-second) review budget per team. "
-            "You scan the requirements mapping table, the deliverables, and the automated evidence ledger. "
-            "Your primary lens is Data Provenance and Geomatic Rigor: you verify whether official NASA/USGS "
-            "datasets (HiRISE 1 m DTM, rover waypoints, geologic maps, radiation baselines) are properly "
-            "cited with working URLs, whether MEASURED, DERIVED, and SIMULATED values are honestly separated "
-            "without fabricating missing sensor layers, and whether multi-scale remote sensing (1 m stereo "
-            "noise vs. 4 m / 16 m / 64 m slope kernels) is empirically validated."
-        ),
-    },
-    "J3_global_planetary_cartography_sme": {
-        "tier": "TIER_2_SME",
-        "preferred_model": "gemini-3.5-flash",
-        "temperature": "0.70",
-        "time_limit_sec": "300",
-        "queue_pressure": (
-            "Global Nominee #28 of 45 in the Planetary Cartography & EVA Operations SME Triage Batch "
-            "(simulated 300-second / 5-minute review budget)"
-        ),
-        "role": (
-            "You are a Global Judging Subject Matter Expert in Planetary Cartography and Extravehicular "
-            "Activity (EVA) Surface Operations. You have 45 Global Nominees to score in a 5-minute "
-            "(300-second) window per project. You evaluate whether this project goes beyond regional "
-            "orbital tile viewers to solve hyper-local human EVA survival: integrating >=3 distinct NASA "
-            "datasets (topography/slope, rover POV imagery, space radiation/refuge, atmospheric/thermal "
-            "constraints), exposing the scale bias between coarse 64 m orbital maps and 4 m human-scale "
-            "scarps, and providing actionable astronaut decision support (route planning, walkback limit, "
-            "suit telemetry)."
-        ),
-    },
-    "J4_global_geodesy_ivv_sme": {
-        "tier": "TIER_2_SME",
-        "preferred_model": "gemini-3.7-flash",
-        "temperature": "0.45",
-        "time_limit_sec": "300",
-        "queue_pressure": (
-            "Global Nominee #31 of 45 in the Planetary Geodesy & Software IV&V Triage Queue "
-            "(simulated 300-second / 5-minute review budget)"
-        ),
-        "role": (
-            "You are a Global Judging Subject Matter Expert in Planetary Geodesy, Photogrammetry, and "
-            "Independent Verification & Validation (IV&V). You inspect mathematical, physical, and software "
-            "validity under strict engineering standards: planetocentric spherical geodesy (R = 3,396,190 m, "
-            "cos(lat) scaling), Horn (1981) 3x3 slope kernels across 1 m / 4 m / 16 m / 64 m baselines "
-            "validated against ground-truth rover tilts, >=4 m rock formation obstacle avoidance, suited "
-            "metabolic power (Minetti/Pandolf) + crew pair + rover transport economics, UHF 414.2 MHz "
-            "knife-edge diffraction, SHA-256 pack integrity, and clean pytest execution. You also answer "
-            "the SME survey question: 'adds_professional_value' (boolean)."
-        ),
-    },
-    "J5_exec_mission_directorate_reviewer": {
-        "tier": "TIER_3_EXEC",
-        "preferred_model": "gemini-3.7-flash",
-        "temperature": "0.60",
-        "time_limit_sec": "240",
-        "queue_pressure": (
-            "Executive Finalist #19 of 25 in the Executive Mission Directorate Final Ballot "
-            "(simulated 240-second / 4-minute executive briefing window)"
-        ),
-        "role": (
-            "You are on the Executive Judging Committee representing space agency mission leadership. "
-            "You have a 240-second (4-minute) executive briefing window to review this finalist dossier "
-            "and affix your official score across all 5 criteria, with special focus on Impact, Creativity, "
-            "Best Mission Concept, Best Use of Data, and Best Use of Science. You evaluate whether this "
-            "system could genuinely inform Moon-to-Mars xEVA surface operations and protect astronaut lives "
-            "through strict non-compensatory safety vetoes, and which of the 10 Global Awards it merits."
-        ),
-    },
-}
+JUDGES: dict[str, dict[str, str]] = copy.deepcopy(DEFAULT_JUDGES)
+CRITERIA: list[str] = criterion_names(SETTINGS)
+AWARDS: list[str] = list(DEFAULT_AWARDS)
 
-AWARDS = [
-    "Best Use of Science",
-    "Best Use of Data",
-    "Best Use of Technology",
-    "Galactic Impact",
-    "Best Mission Concept",
-    "Most Inspirational",
-    "Best Storytelling Award",
-    "Global Connection Award",
-    "Art & Technology Award",
-    "Local Impact Award",
-]
-
-INSTRUCTIONS = """
+INSTRUCTIONS_TEMPLATE = """
 ## SCORING RULES (strict, non-negotiable — Judge v3.0 Calibration & Blind Ranking Edition)
-1. Score each of the 5 official criteria (Impact, Creativity, Validity, Relevance, Presentation) with an INTEGER 1-5.
+1. Score each of the @@K@@ official criteria (@@CRITERIA_CSV@@) with an INTEGER 1-5.
    Only the "Score of 5" descriptors are official. Use these strict historical percentile anchors:
    1 = not addressed / absent (bottom 20%);
    2 = weak, major gaps (20th–50th percentile);
    3 = adequate hackathon submission, meets the general description with notable gaps (historical median ~3.0/5, 50th–80th percentile);
    4 = strong local nominee / global contender, only minor gaps (80th–95th percentile);
-   5 = TOP 5% GLOBAL FINALIST / WINNER LEVEL — the official "Score of 5" descriptor is 100% met, proven by automated evidence, AND demonstrably superior to >=95% of Space Apps entries in the cohort.
+   5 = TOP 5% GLOBAL FINALIST / WINNER LEVEL — the official "Score of 5" descriptor is 100% met, proven by automated evidence, AND demonstrably superior to >=95% of @@HACKATHON@@ entries in the cohort.
 2. FACTS: you may only rely on (a) the SUBMISSION TEXT (`<<<SUB ... SUB>>>`) and (b) the EVIDENCE LEDGER produced by automated probes.
    Anything the submission CLAIMS but the evidence does not confirm (or contradicts) counts as NOT demonstrated.
    Do not use outside knowledge about this team. You MAY use general domain knowledge to judge scientific validity
@@ -185,13 +87,13 @@ INSTRUCTIONS = """
    AND at least one short verbatim quote (5-25 words) copied EXACTLY from `<<<SUB ... SUB>>>` or the evidence ledger
    (plain substring without markdown formatting). Quotes are machine-checked; a paraphrased quote invalidates your score.
 4. Gate failures (G-xx with status FAIL) are eligibility problems. Mention them; they do not change criteria scores
-   except where they affect what a judge can actually see (e.g. no demo -> Presentation cannot exceed 2).
+   except where they affect what a judge can actually see (e.g. no demo -> @@PRESENTATION_CAP@@ cannot exceed 2).
 5. MANDATORY CALIBRATION & BLIND COHORT RANKING (`cohort_ranking`):
    Below, you are given a shuffled 10-project cohort (`SYNTH_ARCH_01` through `SYNTH_ARCH_09` + `CANDIDATE_SUBMISSION`).
    Before assigning your final scores to `CANDIDATE_SUBMISSION`, you MUST rank all 10 projects from rank 1 (best) to rank 10 (worst)
-   and assign each a `total_25` score (5 to 25).
-   - A project that FAILS mandatory delivery gates (`G-01`/`G-02` public URL or `G-04` demo file) CANNOT outrank a complete Tier-4 archetype (`SYNTH_ARCH_01` or `SYNTH_ARCH_02`) on overall `total_25`, because Presentation is capped at <=2.
-   - Your `total_25` for `CANDIDATE_SUBMISSION` in `cohort_ranking` MUST equal the sum of your 5 criterion scores!
+   and assign each a `@@TOTAL_KEY@@` score (@@K@@ to @@MAX@@).
+   - A project that FAILS mandatory delivery gates (`G-01`/`G-02` public URL or `G-04` demo file) CANNOT outrank a complete Tier-4 archetype (`SYNTH_ARCH_01` or `SYNTH_ARCH_02`) on overall `@@TOTAL_KEY@@`, because @@PRESENTATION_CAP@@ is capped at <=2.
+   - Your `@@TOTAL_KEY@@` for `CANDIDATE_SUBMISSION` in `cohort_ranking` MUST equal the sum of your @@K@@ criterion scores!
    - When justifying any `5/5` score on `CANDIDATE_SUBMISSION`, explicitly contrast it against at least one benchmark (`SYNTH_ARCH_03`, `SYNTH_ARCH_04`, etc.) to prove why it is superior.
 6. MANDATORY CRITICAL RIGOR: You MUST identify at least 3 concrete `weaknesses` (even on strong submissions, e.g. missing gates, single-site spatial scope, unmeasured sensor layers, UI/demo gaps).
 7. MANDATORY PERSONAL JUDGE DEBRIEF (`judge_debrief`):
@@ -219,22 +121,18 @@ INSTRUCTIONS = """
     "must_keep_sacred": ["<item 1 to never break/remove>", "<item 2 to never break/remove>"]
   },
   "cohort_ranking": [
-    {"cohort_id": "SYNTH_ARCH_02_TIER4_COMPLETE_PHYSICS", "rank": 1, "total_25": 24, "one_line_verdict": "<why>"},
-    {"cohort_id": "CANDIDATE_SUBMISSION", "rank": 4, "total_25": 20, "one_line_verdict": "<why>"}
+    {"cohort_id": "SYNTH_ARCH_02_TIER4_COMPLETE_PHYSICS", "rank": 1, "@@TOTAL_KEY@@": @@EX_TOP@@, "one_line_verdict": "<why>"},
+    {"cohort_id": "CANDIDATE_SUBMISSION", "rank": 4, "@@TOTAL_KEY@@": @@EX_CAND@@, "one_line_verdict": "<why>"}
   ],
   "scores": [
-    {"criterion": "Impact",       "score": 1, "justification": "...", "evidence_ids": ["SUB","E-02"], "quotes": ["exact quote"]},
-    {"criterion": "Creativity",   "score": 1, "justification": "...", "evidence_ids": [...], "quotes": [...]},
-    {"criterion": "Validity",     "score": 1, "justification": "...", "evidence_ids": [...], "quotes": [...]},
-    {"criterion": "Relevance",    "score": 1, "justification": "...", "evidence_ids": [...], "quotes": [...]},
-    {"criterion": "Presentation", "score": 1, "justification": "...", "evidence_ids": [...], "quotes": [...]}
+@@SCORES_SCHEMA@@
   ],
   "strengths":  [{"text": "...", "evidence_ids": ["..."]}],
-  "weaknesses": [{"text": "...", "criterion": "Validity", "evidence_ids": ["..."]}],
+  "weaknesses": [{"text": "...", "criterion": @@WEAKNESS_CRIT@@, "evidence_ids": ["..."]}],
   "fixes_before_deadline": [
-    {"action": "...", "criterion": "Presentation", "expected_gain": 1, "effort_minutes": 30, "evidence_ids": ["..."]}
+    {"action": "...", "criterion": @@FIX_CRIT@@, "expected_gain": 1, "effort_minutes": 30, "evidence_ids": ["..."]}
   ],
-  "award_fit": [{"award": "<one of the 10 official awards>", "rationale": "...", "evidence_ids": ["..."]}],
+  "award_fit": [{"award": "@@AWARD_HINT@@", "rationale": "...", "evidence_ids": ["..."]}],
   "adds_professional_value": true,
   "adds_professional_value_rationale": "1-2 sentences answering whether this submission adds value to professional work",
   "nominate_global": true,
@@ -243,9 +141,92 @@ INSTRUCTIONS = """
 """
 
 
+def build_instructions(criteria: list[str], awards: list[str], hackathon_label: str = "Space Apps") -> str:
+    """Render the scoring rules + JSON schema for K criteria (max total = 5*K) and the official awards list.
+
+    With the 5 NASA criteria, the 10 NASA awards and the "Space Apps" label this returns the exact v3.0 text.
+    """
+    if not criteria:
+        raise ValueError("at least 1 criterion is required")
+    k = len(criteria)
+    mx = max_total(criteria)
+    width = max(len(json.dumps(c)) for c in criteria) + 2
+    rows = []
+    for i, c in enumerate(criteria):
+        ids_quotes = '["SUB","E-02"], "quotes": ["exact quote"]' if i == 0 else '[...], "quotes": [...]'
+        sep = "," if i < k - 1 else ""
+        rows.append(
+            f'    {{"criterion": {(json.dumps(c) + ",").ljust(width)}"score": 1, "justification": "...", '
+            f'"evidence_ids": {ids_quotes}}}{sep}'
+        )
+    if len(awards) == 1:
+        award_hint = "<the 1 official award, only if it genuinely fits>"
+    elif awards:
+        award_hint = f"<one of the {len(awards)} official awards>"
+    else:
+        award_hint = "<free-form award or prize category this project fits (no official award list)>"
+    presentation = "Presentation" if "Presentation" in criteria else "any presentation/demo-related criterion"
+    replacements = {
+        "@@K@@": str(k),
+        "@@CRITERIA_CSV@@": ", ".join(criteria),
+        "@@HACKATHON@@": hackathon_label,
+        "@@PRESENTATION_CAP@@": presentation,
+        "@@TOTAL_KEY@@": f"total_{mx}",
+        "@@MAX@@": str(mx),
+        "@@EX_TOP@@": str(round(24 * mx / 25)),
+        "@@EX_CAND@@": str(round(20 * mx / 25)),
+        "@@SCORES_SCHEMA@@": "\n".join(rows),
+        "@@WEAKNESS_CRIT@@": json.dumps(criteria[2] if k > 2 else criteria[-1]),
+        "@@FIX_CRIT@@": json.dumps(criteria[-1]),
+        "@@AWARD_HINT@@": award_hint,
+    }
+    text = INSTRUCTIONS_TEMPLATE
+    for token, value in replacements.items():
+        text = text.replace(token, value)
+    return text
+
+
+INSTRUCTIONS = build_instructions(CRITERIA, AWARDS)
+
+
+def load_runtime() -> None:
+    """Load rubric, submission, evidence, hackathon settings and judges from /judge (inside the VM)."""
+    global RUBRIC, CHALLENGE, SUB, SUB_TEXT, EVIDENCE, SETTINGS, JUDGES, CRITERIA, AWARDS, INSTRUCTIONS
+    RUBRIC = (ROOT / "rubric" / "judging_guide_2026.md").read_text(encoding="utf-8")
+    CHALLENGE = (ROOT / "rubric" / "challenge_martian_map_2026.md").read_text(encoding="utf-8")
+    SUB = json.loads((INP / "submission.json").read_text(encoding="utf-8"))
+    SUB_TEXT = (
+        (INP / SUB["submission_text_file"]).read_text(encoding="utf-8", errors="replace")
+        if SUB.get("submission_text_file") and (INP / SUB["submission_text_file"]).exists()
+        else ""
+    )
+    EVIDENCE = json.loads((OUT / "evidence.json").read_text(encoding="utf-8"))
+    SETTINGS = resolve_settings(INP)
+    JUDGES = resolve_judges(INP, SETTINGS["hackathon_name"])
+    CRITERIA = criterion_names(SETTINGS)
+    AWARDS = list(SETTINGS["awards"])
+    INSTRUCTIONS = build_instructions(
+        CRITERIA, AWARDS, "Space Apps" if SETTINGS["is_default"] else SETTINGS["hackathon_name"]
+    )
+
+
+def build_criteria_section() -> str:
+    """Custom hackathons only: the K criteria definitions from hackathon_settings.json."""
+    if SETTINGS.get("is_default", True):
+        return ""
+    rows = [
+        f"- **{c['name']}**" + (f": {c['description']}" if c.get("description") else "")
+        for c in SETTINGS["criteria"]
+    ]
+    return (
+        f"# HACKATHON SCORING CRITERIA ({SETTINGS['hackathon_name']} — {len(rows)} criteria, "
+        f"each 1-5, total /{max_total(SETTINGS)})\n" + "\n".join(rows) + "\n"
+    )
+
+
 def build_blind_triage_excerpt(full_text: str, tier: str) -> str:
-    """Anti-marketing blind filter for 5-minute Local/Exec judges."""
-    if tier == "TIER_2_SME":
+    """Anti-marketing blind filter for 5-minute Local/Exec judges (unknown tiers are treated as SME: never truncated)."""
+    if normalize_tier(tier) == "TIER_2_SME":
         return full_text[:28000]
     lines = full_text.splitlines()
     kept: list[str] = []
@@ -286,7 +267,7 @@ def build_cohort_section(jid: str) -> str:
 
 
 def build_prompt(jid: str, spec: dict[str, str]) -> str:
-    tier = spec["tier"]
+    tier = normalize_tier(spec.get("tier"))
     vis = [
         e
         for e in EVIDENCE
@@ -305,6 +286,7 @@ def build_prompt(jid: str, spec: dict[str, str]) -> str:
         f"**Queue Context**: {spec['queue_pressure']}.\n"
         f"**Role**: {spec['role']}\n"
         f"{INSTRUCTIONS}\n"
+        f"{build_criteria_section()}"
         f"# OFFICIAL JUDGING GUIDE\n{RUBRIC}\n"
         f"# CHALLENGE BRIEF\n{CHALLENGE}\n"
         f"{cohort_block}\n\n"
@@ -462,11 +444,23 @@ def call_judge(jid: str, spec: dict[str, str], model: str) -> dict:
 
 
 def main() -> int:
-    target_judges = (
-        {SINGLE_JUDGE: JUDGES[SINGLE_JUDGE]}
-        if SINGLE_JUDGE and SINGLE_JUDGE in JUDGES
-        else JUDGES
+    load_runtime()
+    print(
+        f"[panel] {SETTINGS['hackathon_name']}: {len(JUDGES)} judge(s), {len(CRITERIA)} criteria "
+        f"(/{max_total(SETTINGS)}), {len(AWARDS)} official award(s)",
+        flush=True,
     )
+    if SINGLE_JUDGE and SINGLE_JUDGE not in JUDGES:
+        # Never silently fan out to the whole panel inside one VM (N judges x N VMs).
+        err = f"unknown judge id {SINGLE_JUDGE!r}; known: {list(JUDGES)}"
+        print(f"  {err}", flush=True)
+        (OUT / f"panel_{SINGLE_JUDGE}.json").write_text(
+            json.dumps({"judge": SINGLE_JUDGE, "_error": err, "scores": [], "strengths": [], "weaknesses": [],
+                        "fixes_before_deadline": [], "award_fit": []}, indent=2),
+            encoding="utf-8",
+        )
+        return 2
+    target_judges = {SINGLE_JUDGE: JUDGES[SINGLE_JUDGE]} if SINGLE_JUDGE else JUDGES
 
     results = []
     for idx, (jid, spec) in enumerate(target_judges.items()):
